@@ -13,7 +13,6 @@
     "resolveJsonModule": true,
     "rootDir": "src",
     "skipLibCheck": true,
-    "noCheck": true,
     "strict": true,
     "target": "es2023"
   },
