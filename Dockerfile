@@ -24,13 +24,10 @@ COPY scripts ./scripts
 RUN pnpm install --frozen-lockfile
 
 COPY . .
-# Increase Node.js heap limit for constrained-memory hosts (e.g. Synology DS420J ~1GB RAM)
-ENV NODE_OPTIONS="--max-old-space-size=768"
 RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
 # Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
-ENV NODE_OPTIONS=""
 
 ENV NODE_ENV=production
 
