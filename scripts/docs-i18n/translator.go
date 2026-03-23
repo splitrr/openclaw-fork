@@ -4,26 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
-
-	pi "github.com/joshp123/pi-golang"
+	"time"
 )
 
+const (
+	translateMaxAttempts     = 3
+	translateBaseDelay       = 15 * time.Second
+	defaultPromptTimeout     = 2 * time.Minute
+	envDocsI18nPromptTimeout = "OPENCLAW_DOCS_I18N_PROMPT_TIMEOUT"
+)
+
+var errEmptyTranslation = errors.New("empty translation")
+
 type PiTranslator struct {
-	client *pi.OneShotClient
+	client *docsPiClient
 }
 
-func NewPiTranslator(srcLang, tgtLang string, glossary []GlossaryEntry) (*PiTranslator, error) {
-	options := pi.DefaultOneShotOptions()
-	options.AppName = "openclaw-docs-i18n"
-	options.Mode = pi.ModeDragons
-	options.Dragons = pi.DragonsOptions{
-		Provider: "anthropic",
-		Model:    modelVersion,
-		Thinking: "high",
-	}
-	options.SystemPrompt = translationPrompt(srcLang, tgtLang, glossary)
-	client, err := pi.StartOneShot(options)
+func NewPiTranslator(srcLang, tgtLang string, glossary []GlossaryEntry, thinking string) (*PiTranslator, error) {
+	client, err := startDocsPiClient(context.Background(), docsPiClientOptions{
+		SystemPrompt: translationPrompt(srcLang, tgtLang, glossary),
+		Thinking:     normalizeThinking(thinking),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -31,6 +34,14 @@ func NewPiTranslator(srcLang, tgtLang string, glossary []GlossaryEntry) (*PiTran
 }
 
 func (t *PiTranslator) Translate(ctx context.Context, text, srcLang, tgtLang string) (string, error) {
+	return t.translate(ctx, text, t.translateMasked)
+}
+
+func (t *PiTranslator) TranslateRaw(ctx context.Context, text, srcLang, tgtLang string) (string, error) {
+	return t.translate(ctx, text, t.translateRaw)
+}
+
+func (t *PiTranslator) translate(ctx context.Context, text string, run func(context.Context, string) (string, error)) (string, error) {
 	if t.client == nil {
 		return "", errors.New("pi client unavailable")
 	}
@@ -38,20 +49,93 @@ func (t *PiTranslator) Translate(ctx context.Context, text, srcLang, tgtLang str
 	if core == "" {
 		return text, nil
 	}
+	translated, err := t.translateWithRetry(ctx, func(ctx context.Context) (string, error) {
+		return run(ctx, core)
+	})
+	if err != nil {
+		return "", err
+	}
+	return prefix + translated + suffix, nil
+}
+
+func (t *PiTranslator) translateWithRetry(ctx context.Context, run func(context.Context) (string, error)) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < translateMaxAttempts; attempt++ {
+		translated, err := run(ctx)
+		if err == nil {
+			return translated, nil
+		}
+		if !isRetryableTranslateError(err) {
+			return "", err
+		}
+		lastErr = err
+		if attempt+1 < translateMaxAttempts {
+			delay := translateBaseDelay * time.Duration(attempt+1)
+			if err := sleepWithContext(ctx, delay); err != nil {
+				return "", err
+			}
+		}
+	}
+	return "", lastErr
+}
+
+func (t *PiTranslator) translateMasked(ctx context.Context, core string) (string, error) {
 	state := NewPlaceholderState(core)
 	placeholders := make([]string, 0, 8)
 	mapping := map[string]string{}
 	masked := maskMarkdown(core, state.Next, &placeholders, mapping)
-	res, err := t.client.Run(ctx, masked)
+	resText, err := runPrompt(ctx, t.client, masked)
 	if err != nil {
 		return "", err
 	}
-	translated := strings.TrimSpace(res.Text)
+	translated := strings.TrimSpace(resText)
+	if translated == "" {
+		return "", errEmptyTranslation
+	}
 	if err := validatePlaceholders(translated, placeholders); err != nil {
 		return "", err
 	}
-	translated = unmaskMarkdown(translated, placeholders, mapping)
-	return prefix + translated + suffix, nil
+	return unmaskMarkdown(translated, placeholders, mapping), nil
+}
+
+func (t *PiTranslator) translateRaw(ctx context.Context, core string) (string, error) {
+	resText, err := runPrompt(ctx, t.client, core)
+	if err != nil {
+		return "", err
+	}
+	translated := strings.TrimSpace(resText)
+	if translated == "" {
+		return "", errEmptyTranslation
+	}
+	return translated, nil
+}
+
+func isRetryableTranslateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, errEmptyTranslation) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "authentication failed") {
+		return false
+	}
+	return strings.Contains(message, "placeholder missing") || strings.Contains(message, "rate limit") || strings.Contains(message, "429")
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (t *PiTranslator) Close() {
@@ -60,45 +144,50 @@ func (t *PiTranslator) Close() {
 	}
 }
 
-func translationPrompt(srcLang, tgtLang string, glossary []GlossaryEntry) string {
-	srcLabel := srcLang
-	tgtLabel := tgtLang
-	if strings.EqualFold(srcLang, "en") {
-		srcLabel = "English"
-	}
-	if strings.EqualFold(tgtLang, "zh-CN") {
-		tgtLabel = "Simplified Chinese"
-	}
-	glossaryBlock := buildGlossaryPrompt(glossary)
-	return strings.TrimSpace(fmt.Sprintf(`You are a translation function, not a chat assistant.
-Translate from %s to %s.
-
-Rules:
-- Output ONLY the translated text. No preamble, no questions, no commentary.
-- Preserve Markdown syntax exactly (headings, lists, tables, emphasis).
-- Do not translate code spans/blocks, config keys, CLI flags, or env vars.
-- Do not alter URLs or anchors.
-- Preserve placeholders exactly: __OC_I18N_####__.
-- Use neutral technical Chinese; avoid slang or jokes.
-- Keep product names in English: OpenClaw, Gateway, Pi, WhatsApp, Telegram, Discord, iMessage, Slack, Microsoft Teams, Google Chat, Signal.
-
-%s
-
-If the input is empty, output empty.
-If the input contains only placeholders, output it unchanged.`, srcLabel, tgtLabel, glossaryBlock))
+type promptRunner interface {
+	Prompt(context.Context, string) (string, error)
+	Stderr() string
 }
 
-func buildGlossaryPrompt(glossary []GlossaryEntry) string {
-	if len(glossary) == 0 {
-		return ""
+func runPrompt(ctx context.Context, client promptRunner, message string) (string, error) {
+	promptCtx, cancel := context.WithTimeout(ctx, docsI18nPromptTimeout())
+	defer cancel()
+
+	result, err := client.Prompt(promptCtx, message)
+	if err != nil {
+		return "", decoratePromptError(err, client.Stderr())
 	}
-	var lines []string
-	lines = append(lines, "Preferred translations (use when natural):")
-	for _, entry := range glossary {
-		if entry.Source == "" || entry.Target == "" {
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("- %s -> %s", entry.Source, entry.Target))
+	return result, nil
+}
+
+func decoratePromptError(err error, stderr string) error {
+	if err == nil {
+		return nil
 	}
-	return strings.Join(lines, "\n")
+	trimmed := strings.TrimSpace(stderr)
+	if trimmed == "" {
+		return err
+	}
+	return fmt.Errorf("%w (pi stderr: %s)", err, trimmed)
+}
+
+func normalizeThinking(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low", "high":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "high"
+	}
+}
+
+func docsI18nPromptTimeout() time.Duration {
+	value := strings.TrimSpace(os.Getenv(envDocsI18nPromptTimeout))
+	if value == "" {
+		return defaultPromptTimeout
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return defaultPromptTimeout
+	}
+	return parsed
 }
